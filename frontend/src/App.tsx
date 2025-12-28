@@ -1,67 +1,44 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  FaceLandmarker,
-  FilesetResolver,
-  type FaceLandmarkerResult
-} from "@mediapipe/tasks-vision";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FaceLandmarker, FilesetResolver, type FaceLandmarkerResult } from "@mediapipe/tasks-vision";
 import "./global.css";
 
-type MediaState = "idle" | "starting" | "active" | "error";
+type StreamState = "idle" | "starting" | "active" | "error";
 type ModelState = "idle" | "loading" | "ready" | "error";
-type QualityPreset = "low" | "medium" | "high";
+type EventKind = "video" | "audio" | "system";
+type Severity = "info" | "warn" | "error";
+
+type EventRecord = {
+  id: string;
+  ts: string;
+  message: string;
+  severity: Severity;
+  kind: EventKind;
+};
+
 type FaceMetrics = {
   distanceCm: number;
   yawDeg: number;
-  yawDirection: "left" | "right" | "center";
-  closeness: number;
 };
+
+type FaceLandmarks = FaceLandmarkerResult["faceLandmarks"][number];
+
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 const MEDIAPIPE_WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/wasm";
 const FACE_LANDMARKER_MODEL =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task";
-const QUALITY_CONFIG: Record<QualityPreset, { label: string; description: string; constraints: MediaTrackConstraints }> = {
-  low: {
-    label: "360p / 10fps",
-    description: "Best for low bandwidth",
-    constraints: {
-      width: { ideal: 640, max: 640 },
-      height: { ideal: 360, max: 360 },
-      frameRate: { ideal: 10, max: 10 }
-    }
-  },
-  medium: {
-    label: "720p / 24fps",
-    description: "Balanced quality",
-    constraints: {
-      width: { ideal: 1280, max: 1280 },
-      height: { ideal: 720, max: 720 },
-      frameRate: { ideal: 24, max: 30 }
-    }
-  },
-  high: {
-    label: "1080p / 30fps",
-    description: "Maximum clarity",
-    constraints: {
-      width: { ideal: 1920, max: 1920 },
-      height: { ideal: 1080, max: 1080 },
-      frameRate: { ideal: 30, max: 30 }
-    }
-  }
-};
+
 const DEFAULT_IPD_CM = 6.3;
 const BASELINE_VIDEO_WIDTH = 1280;
 const BASELINE_FOCAL_PX = 750;
 const HEAD_YAW_MAX_DEG = 90;
 const RAD2DEG = 180 / Math.PI;
 const YAW_OFFSET_SCALE = 0.55;
-const METRICS_UPDATE_INTERVAL_MS = 80;
 const DISTANCE_RANGE_CM = { min: 10, max: 150 } as const;
 const LANDMARK_INDEX = {
   rightEyeOuter: 33,
   leftEyeOuter: 263,
   noseTip: 1
 } as const;
-
-type FaceLandmarks = FaceLandmarkerResult["faceLandmarks"][number];
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
@@ -94,79 +71,115 @@ const computeFaceMetrics = (landmarks: FaceLandmarks, videoWidth: number): FaceM
   const effectiveFocalPx = BASELINE_FOCAL_PX * widthScale;
   const distanceCmRaw = (DEFAULT_IPD_CM * effectiveFocalPx) / interpupilPx;
   const distanceCm = clamp(distanceCmRaw, DISTANCE_RANGE_CM.min, DISTANCE_RANGE_CM.max);
-  const closeness = clamp(
-    1 - (distanceCm - DISTANCE_RANGE_CM.min) / (DISTANCE_RANGE_CM.max - DISTANCE_RANGE_CM.min),
-    0,
-    1
-  );
 
   const eyeMidX = (leftEye.x + rightEye.x) / 2;
   const noseOffset = noseTip.x - eyeMidX;
   const yawRatio = clamp(noseOffset / (interpupilNorm * YAW_OFFSET_SCALE), -1, 1);
   const yawDegRaw = clamp(-Math.asin(yawRatio) * RAD2DEG, -HEAD_YAW_MAX_DEG, HEAD_YAW_MAX_DEG);
-  const yawDirection = yawDegRaw > 3 ? "right" : yawDegRaw < -3 ? "left" : "center";
 
   return {
     distanceCm,
     yawDeg: yawDegRaw,
-    yawDirection,
-    closeness
   };
 };
 
 function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
   const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
-  const metricsUpdateRef = useRef(0);
-  const mediaStateRef = useRef<MediaState>("idle");
-  const [mediaState, setMediaState] = useState<MediaState>("idle");
+  const animationFrameRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const lastEventRef = useRef<Record<string, number>>({});
+  const sessionId = useMemo(
+    () => (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `session-${Date.now()}`),
+    []
+  );
+
+  const [cameraState, setCameraState] = useState<StreamState>("idle");
+  const [micState, setMicState] = useState<StreamState>("idle");
   const [modelState, setModelState] = useState<ModelState>("idle");
-  const [quality, setQuality] = useState<QualityPreset>("low");
-  const [faceMetrics, setFaceMetrics] = useState<FaceMetrics | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string>("");
+  const [faceCount, setFaceCount] = useState(0);
+  const [primaryYaw, setPrimaryYaw] = useState<number | null>(null);
+  const [primaryDistance, setPrimaryDistance] = useState<number | null>(null);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [speechActive, setSpeechActive] = useState(false);
+  const [events, setEvents] = useState<EventRecord[]>([]);
+  const [overlayMessage, setOverlayMessage] = useState<string | null>("Requesting camera + mic access");
+
+  const addLocalEvent = useCallback((entry: EventRecord) => {
+    setEvents((current) => [...current.slice(-9), entry]);
+  }, []);
+
+  const postEvent = useCallback(
+    async (key: string, kind: EventKind, severity: Severity, message: string) => {
+      const now = Date.now();
+      const last = lastEventRef.current[key];
+      if (last && now - last < 4000) {
+        return;
+      }
+      lastEventRef.current[key] = now;
+
+      const entry: EventRecord = {
+        id: `${now}-${Math.random().toString(16).slice(2)}`,
+        ts: new Date(now).toISOString(),
+        message,
+        severity,
+        kind,
+      };
+      addLocalEvent(entry);
+
+      try {
+        await fetch(`${API_BASE}/events`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId,
+            kind,
+            severity,
+            message,
+            ts: entry.ts,
+          }),
+        });
+      } catch (error) {
+        console.warn("Failed to send event to backend", error);
+      }
+    },
+    [addLocalEvent, sessionId]
+  );
 
   useEffect(() => {
-    mediaStateRef.current = mediaState;
-  }, [mediaState]);
-
-  useEffect(() => {
-    let isCancelled = false;
+    let cancelled = false;
 
     async function loadFaceLandmarker() {
       setModelState("loading");
       try {
         const filesetResolver = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_BASE);
-        const faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
-          baseOptions: {
-            modelAssetPath: FACE_LANDMARKER_MODEL
-          },
+        const instance = await FaceLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: { modelAssetPath: FACE_LANDMARKER_MODEL },
           runningMode: "VIDEO",
-          outputFacialTransformationMatrixes: false,
-          numFaces: 1
+          numFaces: 2,
         });
 
-        if (isCancelled) {
-          faceLandmarker.close();
+        if (cancelled) {
+          instance.close();
           return;
         }
 
-        faceLandmarkerRef.current = faceLandmarker;
+        faceLandmarkerRef.current = instance;
         setModelState("ready");
       } catch (error) {
         console.error("Unable to load MediaPipe face landmarker", error);
-        if (!isCancelled) {
-          setModelState("error");
-        }
+        setModelState("error");
+        setOverlayMessage("Face model failed to load");
       }
     }
 
     loadFaceLandmarker();
 
     return () => {
-      isCancelled = true;
+      cancelled = true;
       animationFrameRef.current && cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
       faceLandmarkerRef.current?.close();
@@ -176,7 +189,7 @@ function App() {
 
   const syncCanvasSize = useCallback(() => {
     const video = videoRef.current;
-    const canvas = overlayCanvasRef.current;
+    const canvas = canvasRef.current;
     if (!video || !canvas || !video.videoWidth || !video.videoHeight) {
       return;
     }
@@ -187,7 +200,7 @@ function App() {
   }, []);
 
   const drawLandmarks = useCallback((result?: FaceLandmarkerResult) => {
-    const canvas = overlayCanvasRef.current;
+    const canvas = canvasRef.current;
     if (!canvas) {
       return;
     }
@@ -202,236 +215,265 @@ function App() {
       return;
     }
 
-    ctx.fillStyle = "rgba(249, 115, 22, 0.9)";
-    ctx.strokeStyle = "rgba(15, 23, 42, 0.8)";
+    ctx.fillStyle = "rgba(245, 217, 126, 0.95)";
+    ctx.strokeStyle = "rgba(12, 18, 33, 0.8)";
     ctx.lineWidth = 1;
 
     primaryFace.forEach((landmark) => {
       const x = landmark.x * canvas.width;
       const y = landmark.y * canvas.height;
       ctx.beginPath();
-      ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+      ctx.arc(x, y, 2, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
     });
   }, []);
 
-  const stopStream = useCallback(() => {
+  const stopStreams = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-    mediaStateRef.current = "idle";
-    setMediaState("idle");
-    setErrorMessage("");
-    setFaceMetrics(null);
-    metricsUpdateRef.current = 0;
+    setCameraState("idle");
+    setMicState("idle");
+    setOverlayMessage("Camera and mic stopped");
+    audioContextRef.current?.close();
+    audioContextRef.current = null;
+    analyserRef.current = null;
   }, []);
 
-  const startStream = useCallback(async () => {
-    if (mediaStateRef.current === "starting" || mediaStateRef.current === "active") {
+  const startStreams = useCallback(async () => {
+    if (cameraState === "starting") {
       return;
     }
-    mediaStateRef.current = "starting";
-    setMediaState("starting");
-    setErrorMessage("");
+    setCameraState("starting");
+    setMicState("starting");
+    setOverlayMessage("Requesting camera + mic access");
 
     try {
       const mediaStream = await navigator.mediaDevices.getUserMedia({
-        video: QUALITY_CONFIG[quality].constraints,
-        audio: false
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 24, max: 30 },
+        },
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
       });
 
       streamRef.current = mediaStream;
       if (videoRef.current) {
         videoRef.current.srcObject = mediaStream;
-        try {
-          await videoRef.current.play();
-          syncCanvasSize();
-        } catch (playError) {
-          console.warn("Video element was unable to autoplay", playError);
-        }
+        videoRef.current.muted = true;
+        await videoRef.current.play();
       }
-      mediaStateRef.current = "active";
-      setMediaState("active");
+
+      const audioCtx = new AudioContext();
+      const analyser = audioCtx.createAnalyser();
+      analyser.smoothingTimeConstant = 0.5;
+      analyser.fftSize = 1024;
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+      source.connect(analyser);
+      audioContextRef.current = audioCtx;
+      analyserRef.current = analyser;
+
+      setCameraState("active");
+      setMicState("active");
+      setOverlayMessage(null);
+      postEvent("media-on", "system", "info", "Camera and mic granted");
     } catch (error) {
-      console.error("Unable to start webcam", error);
-      mediaStateRef.current = "error";
-      setMediaState("error");
-      setErrorMessage(
-        error instanceof DOMException
-          ? error.message
-          : "Unable to access webcam. Please check permissions and try again."
-      );
+      console.error("Unable to start streams", error);
+      setCameraState("error");
+      setMicState("error");
+      setOverlayMessage("Permissions denied or unavailable");
+      postEvent("media-error", "system", "error", "Failed to start camera or mic");
     }
-  }, [quality, syncCanvasSize]);
+  }, [cameraState, postEvent]);
 
   useEffect(() => {
-    startStream();
+    startStreams();
     return () => {
-      stopStream();
+      stopStreams();
     };
-  }, [startStream, stopStream]);
+  }, [startStreams, stopStreams]);
 
   useEffect(() => {
-    if (
-      mediaState !== "active" ||
-      modelState !== "ready" ||
-      !videoRef.current ||
-      !faceLandmarkerRef.current
-    ) {
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = null;
-      }
-      drawLandmarks();
-      setFaceMetrics(null);
-      metricsUpdateRef.current = 0;
-      return;
-    }
+    let cancelled = false;
+    const TIME_DOMAIN_SIZE = 1024;
+    const dataArray = new Uint8Array(TIME_DOMAIN_SIZE);
+    const speechThresholdOn = 0.05;
+    const speechThresholdOff = 0.025;
 
-    let isCancelled = false;
-
-    const renderResult = () => {
-      if (isCancelled) {
+    const analyze = () => {
+      if (cancelled) {
         return;
       }
+
       const video = videoRef.current;
       const landmarker = faceLandmarkerRef.current;
-      if (!video || !landmarker || video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) {
-        animationFrameRef.current = requestAnimationFrame(renderResult);
-        return;
-      }
 
-      syncCanvasSize();
+      if (video && landmarker && modelState === "ready" && video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
+        syncCanvasSize();
+        const result = landmarker.detectForVideo(video, performance.now());
+        drawLandmarks(result);
 
-      const result = landmarker.detectForVideo(video, performance.now());
-      drawLandmarks(result);
-      const primaryFace = result.faceLandmarks?.[0];
-      if (primaryFace) {
-        const metrics = computeFaceMetrics(primaryFace, video.videoWidth);
-        const now = performance.now();
-        if (metrics && now - metricsUpdateRef.current > METRICS_UPDATE_INTERVAL_MS) {
-          setFaceMetrics(metrics);
-          metricsUpdateRef.current = now;
+        const count = result.faceLandmarks?.length ?? 0;
+        setFaceCount(count);
+        if (count > 1) {
+          postEvent("multi-face", "video", "warn", "Multiple faces detected");
+        }
+        const primaryFace = result.faceLandmarks?.[0];
+        if (primaryFace) {
+          const metrics = computeFaceMetrics(primaryFace, video.videoWidth);
+          if (metrics) {
+            setPrimaryYaw(metrics.yawDeg);
+            setPrimaryDistance(metrics.distanceCm);
+            if (Math.abs(metrics.yawDeg) > 35) {
+              postEvent("yaw", "video", "warn", "Viewer looking away from screen");
+            }
+          }
+        } else {
+          setPrimaryYaw(null);
+          setPrimaryDistance(null);
         }
       } else {
-        setFaceMetrics(null);
+        setFaceCount(0);
+        drawLandmarks();
       }
 
-      animationFrameRef.current = requestAnimationFrame(renderResult);
+      const analyser = analyserRef.current;
+      if (analyser) {
+        analyser.getByteTimeDomainData(dataArray);
+        let sumSquares = 0;
+        for (let i = 0; i < dataArray.length; i += 1) {
+          const centered = (dataArray[i] - 128) / 128;
+          sumSquares += centered * centered;
+        }
+        const rms = Math.sqrt(sumSquares / dataArray.length);
+        const level = clamp(rms * 4, 0, 1);
+        setAudioLevel(level);
+
+        if (!speechActive && rms > speechThresholdOn) {
+          setSpeechActive(true);
+          postEvent("speech-on", "audio", "info", "Speech detected");
+        } else if (speechActive && rms < speechThresholdOff) {
+          setSpeechActive(false);
+          postEvent("speech-off", "audio", "info", "Silence detected");
+        }
+      }
+
+      animationFrameRef.current = requestAnimationFrame(analyze);
     };
 
-    animationFrameRef.current = requestAnimationFrame(renderResult);
+    animationFrameRef.current = requestAnimationFrame(analyze);
 
     return () => {
-      isCancelled = true;
+      cancelled = true;
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
       }
     };
-  }, [mediaState, modelState, drawLandmarks, syncCanvasSize]);
+  }, [drawLandmarks, modelState, postEvent, speechActive, syncCanvasSize]);
 
-  const isActive = mediaState === "active";
-  const isIdle = mediaState === "idle";
-  const overlayMessage =
-    mediaState === "error"
-      ? errorMessage
-      : modelState !== "ready"
-        ? modelState === "error"
-          ? "Face landmark model failed to load"
-          : "Loading face landmark model..."
-        : "Waiting for webcam permission";
+  const isCameraActive = cameraState === "active";
+  const isMicActive = micState === "active";
 
   return (
     <main className="app-shell">
-      <header>
-        <p className="eyebrow">FastAPI + React demo</p>
-        <h1>Local Webcam Preview</h1>
-        <p className="lede">
-          Start your webcam and preview the feed locally. No video stream ever
-          leaves your browser.
-        </p>
+      <header className="page-header">
+        <div>
+          <p className="eyebrow">Proctoring prototype</p>
+          <h1>Video + Audio Watcher</h1>
+          <p className="lede">
+            Local-only capture with light heuristics: face presence, gaze drift, and speech activity. Events are pushed to the FastAPI backend for debugging.
+          </p>
+        </div>
+        <div className="session-tag">Session {sessionId.slice(-6)}</div>
       </header>
 
+      <section className="status-grid">
+        <div className={`status-card ${isCameraActive ? "ok" : "warn"}`}>
+          <p className="label">Camera</p>
+          <p className="value">{isCameraActive ? "Active" : cameraState === "starting" ? "Requesting" : "Off"}</p>
+          <small>{overlayMessage ?? "Streaming stays on device"}</small>
+        </div>
+        <div className={`status-card ${isMicActive ? "ok" : "warn"}`}>
+          <p className="label">Microphone</p>
+          <p className="value">{isMicActive ? "Active" : micState === "starting" ? "Requesting" : "Off"}</p>
+          <div className="meter">
+            <div className="meter-fill" style={{ width: `${audioLevel * 100}%` }} />
+          </div>
+          <small>{speechActive ? "Speech detected" : "Silence"}</small>
+        </div>
+        <div className="status-card">
+          <p className="label">Faces in frame</p>
+          <p className="value">{faceCount}</p>
+          <small>{faceCount > 1 ? "Multiple people present" : faceCount === 1 ? "Single face" : "No face"}</small>
+        </div>
+        <div className="status-card">
+          <p className="label">Gaze + distance</p>
+          <p className="value">
+            {primaryYaw !== null ? `${primaryYaw.toFixed(1)}°` : "--"}
+            <span className="muted"> | </span>
+            {primaryDistance !== null ? `${primaryDistance.toFixed(0)} cm` : "--"}
+          </p>
+          <small>{primaryYaw !== null ? "Yaw from nose vs eyes" : "Waiting for a face"}</small>
+        </div>
+      </section>
+
       <section className="video-panel">
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          onLoadedMetadata={syncCanvasSize}
-          className={isActive ? "ready" : "dimmed"}
-        />
-        <canvas ref={overlayCanvasRef} className="landmarks-layer" />
-        {!isActive && (
+        <video ref={videoRef} autoPlay playsInline muted className={isCameraActive ? "ready" : "dimmed"} />
+        <canvas ref={canvasRef} className="overlay" />
+        {!isCameraActive && overlayMessage && (
           <div className="video-overlay">
             <p>{overlayMessage}</p>
           </div>
         )}
+        <div className="pill-row">
+          <span className={`pill ${isCameraActive ? "pill-ok" : "pill-warn"}`}>Camera {isCameraActive ? "on" : "off"}</span>
+          <span className={`pill ${speechActive ? "pill-ok" : "pill-muted"}`}>{speechActive ? "Speech" : "Silence"}</span>
+          <span className="pill pill-neutral">Faces: {faceCount}</span>
+        </div>
       </section>
 
-      <section className="controls">
-        <button type="button" onClick={isActive ? stopStream : startStream} disabled={mediaState === "starting"}>
-          {isActive ? "Stop" : "Start"} camera
-        </button>
-        <div className="quality-toggle" role="group" aria-label="Quality presets">
-          {Object.entries(QUALITY_CONFIG).map(([key, preset]) => {
-            const typedKey = key as QualityPreset;
-            const isSelected = quality === typedKey;
-            return (
-              <button
-                key={key}
-                type="button"
-                className={isSelected ? "selected" : "ghost"}
-                onClick={() => setQuality(typedKey)}
-                disabled={mediaState === "starting" && !isSelected}
-              >
-                <span>{preset.label}</span>
-                <small>{preset.description}</small>
-              </button>
-            );
-          })}
+      <section className="event-stream">
+        <div className="stream-header">
+          <div>
+            <p className="label">Events</p>
+            <h2>Recent telemetry</h2>
+          </div>
+          <div className="actions">
+            <button type="button" className="ghost" onClick={startStreams} disabled={cameraState === "starting"}>
+              Restart capture
+            </button>
+            <button type="button" className="ghost" onClick={stopStreams}>
+              Stop capture
+            </button>
+          </div>
         </div>
-        {!isIdle && (
-          <p className="status">
-            {mediaState === "starting" && "Requesting permission..."}
-            {isActive && "Streaming from your device."}
-            {mediaState === "error" && errorMessage}
-          </p>
+        {events.length === 0 ? (
+          <p className="muted">No events yet. Move, speak, or add another person to trigger telemetry.</p>
+        ) : (
+          <ul className="event-list">
+            {events
+              .slice()
+              .reverse()
+              .map((event) => (
+                <li key={event.id} className={`event-row severity-${event.severity}`}>
+                  <div>
+                    <p className="event-kind">{event.kind}</p>
+                    <p className="event-message">{event.message}</p>
+                  </div>
+                  <p className="event-ts">{new Date(event.ts).toLocaleTimeString()}</p>
+                </li>
+              ))}
+          </ul>
         )}
-      </section>
-
-      <section className="telemetry">
-        <div className="metric-card">
-          <p className="label">Estimated distance</p>
-          <p className="value">{faceMetrics ? `~${faceMetrics.distanceCm.toFixed(0)} cm` : "--"}</p>
-          <div className="gauge" aria-hidden="true">
-            <div className="fill" style={{ width: `${(faceMetrics?.closeness ?? 0) * 100}%` }} />
-          </div>
-          <small>Assumes average 6.3 cm interpupillary distance.</small>
-        </div>
-        <div className="metric-card">
-          <p className="label">Head rotation</p>
-          <p className="value">{faceMetrics ? `${faceMetrics.yawDeg.toFixed(1)}°` : "--"}</p>
-          <div className="radar-track" aria-hidden="true">
-            <div
-              className="radar-indicator"
-              style={{
-                left: `${clamp(((faceMetrics?.yawDeg ?? 0) / HEAD_YAW_MAX_DEG + 1) * 50, 0, 100)}%`
-              }}
-            />
-          </div>
-          <small>
-            {faceMetrics
-              ? faceMetrics.yawDirection === "center"
-                ? "Looking straight"
-                : `Turning ${faceMetrics.yawDirection}`
-              : "No face detected"}
-          </small>
-        </div>
       </section>
     </main>
   );

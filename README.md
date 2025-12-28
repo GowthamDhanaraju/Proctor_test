@@ -1,15 +1,16 @@
-# Webcam Preview (FastAPI + React)
+# Proctoring Prototype (Video + Audio)
 
-This project contains a FastAPI backend scaffold plus a React (Vite) frontend that captures your local webcam feed and displays it in the browser. The video stream never leaves the client.
+Lightweight prototype to exercise the proctoring surface area with only camera/mic signals. The browser runs on-device heuristics (face presence, gaze drift, speech activity) and ships telemetry to a minimal FastAPI backend. No video/audio leaves the browser beyond the short JSON events.
 
-## Requirements
+## What’s Implemented
+- Single camera capture with MediaPipe Face Landmarker (2 faces max) to flag presence and rough head yaw/distance.
+- Audio RMS-based VAD badge (speech/no speech) using the Web Audio API.
+- Event stream sent to the backend for: permission changes, multiple faces, gaze drift, and speech start/stop.
+- Dashboard UI showing camera/mic state, face count, yaw + distance estimate, audio meter, and recent events.
 
-- Python 3.11+
-- Node.js 18+
-- npm (bundled with Node.js)
+## Quick Start
 
-## Backend (FastAPI)
-
+### Backend (FastAPI)
 ```bash
 cd backend
 python -m venv .venv
@@ -17,23 +18,23 @@ python -m venv .venv
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
+The API lives at `http://127.0.0.1:8000`.
 
-The API will be available at `http://127.0.0.1:8000`. A `/health` endpoint is included for quick checks.
-
-## Frontend (React + Vite)
-
+### Frontend (React + Vite)
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
+Open the printed Vite URL (usually `http://localhost:5173`) and grant camera + mic permissions when prompted.
 
-Open the printed Vite URL (defaults to `http://localhost:5173`). Grant camera permission when prompted to see your live feed. Use the Start/Stop button to control the stream.
+## API Surface
+- `GET /health` — liveness check.
+- `POST /events` — ingest telemetry `{ session_id, kind: "video"|"audio"|"system", severity: "info"|"warn"|"error", message, ts }`.
+- `GET /events?limit=50` — newest events (in-memory ring buffer).
+- `GET /status` — counts by severity/kind + latest timestamp.
 
-## Notes
-
-- The frontend talks directly to the browser media APIs, so the backend is only needed if you plan to extend the app with server features.
-- The React client loads the MediaPipe Face Landmarker model locally (no server round-trips) and draws the detected landmark points on an overlaid canvas.
-- Distance and head-rotation telemetry are estimated from landmark geometry (assuming an average 6.3cm interpupillary distance) and shown in realtime.
-- Use the quality toggle to switch between low/medium/high webcam constraints (resolution + FPS) without leaving the browser.
-- Update the allowed origin in `backend/app/main.py` if you change the frontend host/port.
+## Notes and Next Steps
+- Everything is on-device; swap in heavier models (YOLO/InsightFace/pyannote/OpenVINO gaze) server-side later.
+- If you host the frontend elsewhere, update CORS in `backend/app/main.py` and set `VITE_API_BASE` in the frontend to point at the backend.
+- The heuristics are intentionally simple (RMS-based VAD, yaw from landmarks). Replace with production detectors as they’re integrated.

@@ -1,20 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FaceLandmarker, FilesetResolver, type FaceLandmarkerResult } from "@mediapipe/tasks-vision";
-import {
-  FACE_LANDMARKER_MODEL,
-  MEDIAPIPE_WASM_BASE,
-  MIN_FACE_AREA,
-  clamp,
-  computeFaceArea,
-  computeFaceMetrics,
-  type FaceLandmarks,
-} from "./utils";
 import type { EventKind, IndividualFlags, ModelState, PostEventFn, StreamState } from "./types";
 
-const GAZE_YAW_THRESHOLD = 35;
-const YOLO_SAMPLE_MS = 1800;
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const DETECT_SAMPLE_MS = 1600;
+const FACE_STICKY_MS = 3000;
 
 const gadgetLabels = ["cell phone", "laptop", "tv", "remote", "keyboard", "mouse", "tablet", "monitor"];
+
+type Box = { x1: number; y1: number; x2: number; y2: number; label?: string; score?: number };
 
 const overlayForState = (state: StreamState, fallback: string | null) => {
   if (state === "starting") return "Requesting camera + mic access";
@@ -28,8 +24,8 @@ const toKind = (category: "audio" | "gaze" | "faces" | "gadgets" | "system"): Ev
   return "video";
 };
 
-const YoloBadge = ({ state }: { state: ModelState }) => {
-  const text = state === "ready" ? "YOLO active" : state === "loading" ? "Loading YOLO" : "YOLO idle";
+const YoloBadge = ({ state, label }: { state: ModelState; label: string }) => {
+  const text = state === "ready" ? `${label} ready` : state === "loading" ? `Loading ${label}` : `${label} idle`;
   return <span className={`pill ${state === "ready" ? "pill-ok" : "pill-muted"}`}>{text}</span>;
 };
 
@@ -37,43 +33,23 @@ const MediaPills = ({
   isCameraActive,
   speechActive,
   faceCount,
-  yoloState,
+  faceApiState,
+  gadgetYoloState,
 }: {
   isCameraActive: boolean;
   speechActive: boolean;
   faceCount: number;
-  yoloState: ModelState;
+  faceApiState: ModelState;
+  gadgetYoloState: ModelState;
 }) => (
   <div className="pill-row">
     <span className={`pill ${isCameraActive ? "pill-ok" : "pill-warn"}`}>Camera {isCameraActive ? "on" : "off"}</span>
     <span className={`pill ${speechActive ? "pill-ok" : "pill-muted"}`}>{speechActive ? "Speech" : "Silence"}</span>
     <span className="pill pill-neutral">Faces: {faceCount}</span>
-    <YoloBadge state={yoloState} />
+    <YoloBadge state={faceApiState} label="Face API" />
+    <YoloBadge state={gadgetYoloState} label="Gadget YOLO" />
   </div>
 );
-
-const drawLandmarks = (canvas: HTMLCanvasElement | null, result?: FaceLandmarkerResult) => {
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  const primaryFace = result?.faceLandmarks?.[0];
-  if (!primaryFace) return;
-
-  ctx.fillStyle = "rgba(245, 217, 126, 0.95)";
-  ctx.strokeStyle = "rgba(12, 18, 33, 0.8)";
-  ctx.lineWidth = 1;
-
-  primaryFace.forEach((landmark) => {
-    const x = landmark.x * canvas.width;
-    const y = landmark.y * canvas.height;
-    ctx.beginPath();
-    ctx.arc(x, y, 2, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-  });
-};
 
 const useOffscreenCanvas = () => {
   const ref = useRef<HTMLCanvasElement | null>(null);
@@ -85,40 +61,34 @@ const useOffscreenCanvas = () => {
 
 export function IndividualProctor({ flags, postEvent }: { flags: IndividualFlags; postEvent: PostEventFn }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
-  const yoloRef = useRef<((input: unknown) => Promise<any[]>) | null>(null);
+  const faceRequestRef = useRef(false);
+  const lastFacePositiveRef = useRef<number | null>(null);
+  const lastFaceCountRef = useRef(0);
+  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const detectionDataRef = useRef<{ sourceW: number; sourceH: number; faces: Box[]; gadgets: Box[] } | null>(null);
+  const faceLandmarkerRef = useRef<any>(null);
+  const gazeBusyRef = useRef(false);
+  const gazeBaselineRef = useRef<{ yaw: number; pitch: number }>({ yaw: 0, pitch: 0 });
+  const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const [cameraState, setCameraState] = useState<StreamState>("idle");
   const [micState, setMicState] = useState<StreamState>("idle");
-  const [modelState, setModelState] = useState<ModelState>("idle");
-  const [yoloState, setYoloState] = useState<ModelState>("idle");
+  const [faceApiState, setFaceApiState] = useState<ModelState>("idle");
+  const [gadgetYoloState, setGadgetYoloState] = useState<ModelState>("idle");
   const [faceCount, setFaceCount] = useState(0);
-  const [primaryYaw, setPrimaryYaw] = useState<number | null>(null);
-  const [primaryDistance, setPrimaryDistance] = useState<number | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
   const [speechActive, setSpeechActive] = useState(false);
   const [overlayMessage, setOverlayMessage] = useState<string | null>("Requesting camera + mic access");
   const offscreenCanvasRef = useOffscreenCanvas();
   const [gadgetHit, setGadgetHit] = useState<string | null>(null);
+  const [gazeAngles, setGazeAngles] = useState<{ yaw: number | null; pitch: number | null }>({ yaw: null, pitch: null });
+  const [showAngles, setShowAngles] = useState(false);
 
   const isCameraActive = cameraState === "active";
   const isMicActive = micState === "active";
-
-  const syncCanvasSize = useCallback(() => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || !video.videoWidth || !video.videoHeight) {
-      return;
-    }
-    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-    }
-  }, []);
 
   const startStreams = useCallback(async () => {
     if (cameraState === "starting" || cameraState === "active") return;
@@ -184,40 +154,11 @@ export function IndividualProctor({ flags, postEvent }: { flags: IndividualFlags
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function loadFaceLandmarker() {
-      setModelState("loading");
-      try {
-        const filesetResolver = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_BASE);
-        const instance = await FaceLandmarker.createFromOptions(filesetResolver, {
-          baseOptions: { modelAssetPath: FACE_LANDMARKER_MODEL },
-          runningMode: "VIDEO",
-          numFaces: 3,
-        });
-
-        if (cancelled) {
-          instance.close();
-          return;
-        }
-
-        faceLandmarkerRef.current = instance;
-        setModelState("ready");
-      } catch (error) {
-        console.error("Unable to load MediaPipe face landmarker", error);
-        setModelState("error");
-        setOverlayMessage("Face model failed to load");
-      }
-    }
-
-    loadFaceLandmarker();
-
     return () => {
-      cancelled = true;
-      animationFrameRef.current && cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-      faceLandmarkerRef.current?.close();
-      faceLandmarkerRef.current = null;
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
       stopStreams();
     };
   }, [stopStreams]);
@@ -237,49 +178,8 @@ export function IndividualProctor({ flags, postEvent }: { flags: IndividualFlags
       if (cancelled) return;
 
       const video = videoRef.current;
-      const landmarker = faceLandmarkerRef.current;
-
-      if (video && landmarker && modelState === "ready" && video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
-        syncCanvasSize();
-        const result = landmarker.detectForVideo(video, performance.now());
-        drawLandmarks(canvasRef.current, result);
-
-        const count = result.faceLandmarks?.length ?? 0;
-        setFaceCount(count);
-        if (flags.faces && count > 1) {
-          postEvent("multi-face", "faces", toKind("faces"), "warn", "Multiple faces detected");
-        }
-        const primaryFace = result.faceLandmarks?.[0];
-        if (primaryFace) {
-          const area = computeFaceArea(primaryFace as FaceLandmarks);
-          if (area < MIN_FACE_AREA) {
-            setOverlayMessage("Face is too small — move closer or increase brightness");
-            if (flags.faces) {
-              postEvent("face-small", "faces", toKind("faces"), "warn", "Face too small for reliable landmarks");
-            }
-          } else {
-            setOverlayMessage(null);
-          }
-          const metrics = computeFaceMetrics(primaryFace as FaceLandmarks, video.videoWidth);
-          if (metrics) {
-            setPrimaryYaw(metrics.yawDeg);
-            setPrimaryDistance(metrics.distanceCm);
-            if (flags.gaze && Math.abs(metrics.yawDeg) > GAZE_YAW_THRESHOLD) {
-              postEvent("yaw", "gaze", toKind("gaze"), "warn", "Viewer looking away from screen");
-            }
-          }
-        } else {
-          setPrimaryYaw(null);
-          setPrimaryDistance(null);
-          setOverlayMessage("No face detected");
-          if (flags.faces) {
-            postEvent("no-face", "faces", toKind("faces"), "warn", "No face detected");
-          }
-        }
-      } else {
-        setFaceCount(0);
-        drawLandmarks(canvasRef.current);
-        setOverlayMessage("No face detected");
+      if (!video || video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) {
+        setFaceCount((prev) => prev);
       }
 
       const analyser = analyserRef.current;
@@ -317,70 +217,351 @@ export function IndividualProctor({ flags, postEvent }: { flags: IndividualFlags
         animationFrameRef.current = null;
       }
     };
-  }, [flags.audio, flags.faces, flags.gaze, modelState, postEvent, speechActive, syncCanvasSize]);
+  }, [flags.audio, postEvent, speechActive]);
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const vision = await import("@mediapipe/tasks-vision");
+        const fileset = await vision.FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/wasm"
+        );
+        const landmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          },
+          runningMode: "IMAGE",
+          numFaces: 1,
+          outputFaceBlendshapes: false,
+          outputFacialTransformationMatrixes: false,
+        });
+        if (!cancelled) {
+          faceLandmarkerRef.current = landmarker;
+        }
+      } catch (error) {
+        console.error("Failed to load MediaPipe FaceLandmarker", error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (faceLandmarkerRef.current?.close) {
+        try {
+          faceLandmarkerRef.current.close();
+        } catch (error) {
+          console.warn("Failed to close face landmarker", error);
+        }
+      }
+      faceLandmarkerRef.current = null;
+    };
+  }, []);
+
+  const renderFrame = useCallback((): HTMLCanvasElement | null => {
+    const video = videoRef.current;
+    const offscreen = offscreenCanvasRef.current;
+    if (!video || !offscreen || video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) {
+      return null;
+    }
+    offscreen.width = 640;
+    offscreen.height = Math.floor((video.videoHeight / video.videoWidth) * 640) || 360;
+    const ctx = offscreen.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+    return offscreen;
+  }, [offscreenCanvasRef]);
+
+  const captureFrameBlob = useCallback(
+    (frame: HTMLCanvasElement) =>
+      new Promise<Blob>((resolve, reject) => {
+        frame.toBlob((blob) => {
+          if (blob) return resolve(blob);
+          reject(new Error("Could not capture frame"));
+        }, "image/jpeg", 0.8);
+      }),
+    []
+  );
+
+  const runFaceDetection = useCallback(
+    async (frame: HTMLCanvasElement | null) => {
+      if (!flags.faces || !frame || faceRequestRef.current) return;
+
+      faceRequestRef.current = true;
+      if (faceApiState === "idle") setFaceApiState("loading");
+
+      try {
+        const blob = await captureFrameBlob(frame);
+        const form = new FormData();
+        form.append("file", blob, "frame.jpg");
+
+        const resp = await fetch(`${API_BASE}/detect/face?conf=0.12`, {
+          method: "POST",
+          body: form,
+        });
+
+        if (!resp.ok) {
+          throw new Error(`Face API error ${resp.status}`);
+        }
+
+        const data: { count?: number; width?: number; height?: number; boxes?: Box[] } = await resp.json();
+        setFaceApiState("ready");
+
+        const detected = typeof data.count === "number" ? Math.max(0, data.count) : 0;
+        const now = Date.now();
+
+        detectionDataRef.current = {
+          sourceW: frame.width,
+          sourceH: frame.height,
+          faces: Array.isArray(data.boxes)
+            ? data.boxes.map((b) => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2, score: b.score, label: "face" }))
+            : [],
+          gadgets: detectionDataRef.current?.gadgets ?? [],
+        };
+
+        if (detected > 0) {
+          lastFacePositiveRef.current = now;
+          lastFaceCountRef.current = detected;
+          setFaceCount(detected);
+        } else {
+          const lastTs = lastFacePositiveRef.current;
+          const stale = !lastTs || now - lastTs > FACE_STICKY_MS;
+          const fallback = stale ? 0 : lastFaceCountRef.current;
+          setFaceCount(fallback);
+        }
+
+        const effectiveCount = detected > 0 ? detected : lastFaceCountRef.current;
+        if (flags.faces && effectiveCount > 1) {
+          postEvent("yolo-multi-face", "faces", toKind("faces"), "warn", `${effectiveCount} faces detected (backend)`);
+        }
+      } catch (error) {
+        console.warn("Face API detection failed", error);
+        setFaceApiState((prev) => (prev === "ready" ? "ready" : "error"));
+      } finally {
+        faceRequestRef.current = false;
+      }
+    },
+    [captureFrameBlob, faceApiState, flags.faces, postEvent]
+  );
+
+  const runGadgetDetection = useCallback(
+    async (frame: HTMLCanvasElement | null) => {
+      if (!flags.gadgets || !frame) return;
+
+      if (gadgetYoloState === "idle") setGadgetYoloState("loading");
+
+      try {
+        const blob = await captureFrameBlob(frame);
+        const form = new FormData();
+        form.append("file", blob, "frame.jpg");
+
+        const resp = await fetch(`${API_BASE}/detect/gadget?conf=0.2`, {
+          method: "POST",
+          body: form,
+        });
+
+        if (!resp.ok) throw new Error(`Gadget API error ${resp.status}`);
+
+        const data: { count?: number; width?: number; height?: number; boxes?: Box[] } = await resp.json();
+        setGadgetYoloState("ready");
+
+        const boxes: Box[] = Array.isArray(data.boxes)
+          ? data.boxes.map((b) => ({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2, score: b.score, label: b.label }))
+          : [];
+
+        detectionDataRef.current = {
+          sourceW: frame.width,
+          sourceH: frame.height,
+          faces: detectionDataRef.current?.faces ?? [],
+          gadgets: boxes,
+        };
+
+        const gadget = boxes.find((b) => gadgetLabels.includes((b.label ?? "").toLowerCase()) && (b.score ?? 0) >= 0.35);
+        if (gadget && gadget.label) {
+          const label = gadget.label;
+          setGadgetHit(`${label} (${Math.round((gadget.score ?? 0) * 100)}%)`);
+          postEvent("yolo-gadget", "gadgets", toKind("gadgets"), "warn", `Gadget detected: ${label}`);
+        }
+      } catch (error) {
+        console.warn("Gadget API detection failed", error);
+        setGadgetYoloState((prev) => (prev === "ready" ? "ready" : "error"));
+      }
+    },
+    [captureFrameBlob, flags.gadgets, gadgetYoloState, postEvent]
+  );
+
+  const pickPrimaryFace = useCallback(() => {
+    const data = detectionDataRef.current;
+    if (!data || !data.faces.length) return null;
+    const cx = data.sourceW / 2;
+    const cy = data.sourceH / 2;
+    const best = data.faces.reduce<null | { face: Box; score: number; dist: number }>((acc, face) => {
+      const score = face.score ?? 0;
+      const fx = (face.x1 + face.x2) / 2;
+      const fy = (face.y1 + face.y2) / 2;
+      const dist = Math.hypot(fx - cx, fy - cy);
+      if (!acc) return { face, score, dist };
+      const betterScore = score > acc.score + 0.01;
+      const closeTie = Math.abs(score - acc.score) <= 0.01 && dist < acc.dist;
+      return betterScore || closeTie ? { face, score, dist } : acc;
+    }, null);
+    return best?.face ?? null;
+  }, []);
+
+  const runGazeEstimation = useCallback(async () => {
+    if (!flags.gaze) return;
+    if (gazeBusyRef.current) return;
+    const landmarker = faceLandmarkerRef.current;
+    const video = videoRef.current;
+    const data = detectionDataRef.current;
+    if (!landmarker || !video || !data) return;
+
+    const primary = pickPrimaryFace();
+    if (!primary) return;
+
+    const base = offscreenCanvasRef.current;
+    if (!base || !video.videoWidth || !video.videoHeight) return;
+    base.width = data.sourceW;
+    base.height = data.sourceH;
+    const bctx = base.getContext("2d");
+    if (!bctx) return;
+    bctx.drawImage(video, 0, 0, base.width, base.height);
+
+    const crop = cropCanvasRef.current ?? document.createElement("canvas");
+    cropCanvasRef.current = crop;
+    const w = Math.max(2, Math.round(primary.x2 - primary.x1));
+    const h = Math.max(2, Math.round(primary.y2 - primary.y1));
+    crop.width = w;
+    crop.height = h;
+    const cctx = crop.getContext("2d");
+    if (!cctx) return;
+    cctx.clearRect(0, 0, w, h);
+    cctx.drawImage(base, primary.x1, primary.y1, w, h, 0, 0, w, h);
+    const imageData = cctx.getImageData(0, 0, w, h);
+
+    gazeBusyRef.current = true;
+    try {
+      const result = landmarker.detect(imageData);
+      const landmarks = result.faceLandmarks?.[0];
+      if (!landmarks || landmarks.length < 300) return;
+
+      const leftEye = landmarks[33];
+      const rightEye = landmarks[263];
+      const nose = landmarks[1];
+      const mouth = landmarks[13];
+
+      const eyeCenter = { x: (leftEye.x + rightEye.x) / 2, y: (leftEye.y + rightEye.y) / 2 };
+      const rawYaw = nose.x - eyeCenter.x; // + means looking right from camera POV
+      const rawPitch = nose.y - eyeCenter.y; // + means head lowered; eyes vs nose is more stable than mouth
+
+      // Slowly learn a neutral baseline when the head is approximately centered
+      const baseline = gazeBaselineRef.current;
+      const inNeutralWindow = Math.abs(rawYaw) < 0.05 && Math.abs(rawPitch) < 0.05;
+      if (inNeutralWindow) {
+        baseline.yaw = lerp(baseline.yaw, rawYaw, 0.15);
+        baseline.pitch = lerp(baseline.pitch, rawPitch, 0.15);
+      }
+
+      const yaw = rawYaw - baseline.yaw;
+      const pitch = rawPitch - baseline.pitch;
+
+      setGazeAngles({ yaw, pitch });
+
+      const yawThreshold = 0.08;
+      // Temporarily disable pitch-based flags
+
+      if (yaw > yawThreshold) {
+        postEvent("gaze-right", "gaze", toKind("gaze"), "warn", "Head turned right");
+      } else if (yaw < -yawThreshold) {
+        postEvent("gaze-left", "gaze", toKind("gaze"), "warn", "Head turned left");
+      }
+
+      // Pitch warnings disabled for now
+    } catch (error) {
+      console.warn("Gaze estimation failed", error);
+    } finally {
+      gazeBusyRef.current = false;
+    }
+  }, [flags.gaze, offscreenCanvasRef, pickPrimaryFace, postEvent]);
+
+  const drawOverlay = useCallback(() => {
+    const canvas = overlayCanvasRef.current;
+    const video = videoRef.current;
+    const data = detectionDataRef.current;
+    if (!canvas || !video) return;
+
+    const width = video.clientWidth || video.videoWidth || 640;
+    const height = video.clientHeight || video.videoHeight || 360;
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, width, height);
+    if (!flags.overlays || !data) return;
+
+    const scaleX = width / data.sourceW;
+    const scaleY = height / data.sourceH;
+
+    const drawBoxes = (boxes: Box[], color: string) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.font = "13px Space Grotesk, sans-serif";
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.textBaseline = "top";
+
+      boxes.forEach((b) => {
+        const x = b.x1 * scaleX;
+        const y = b.y1 * scaleY;
+        const w = (b.x2 - b.x1) * scaleX;
+        const h = (b.y2 - b.y1) * scaleY;
+        ctx.strokeRect(x, y, w, h);
+        if (b.label) {
+          const label = `${b.label}${b.score ? ` ${(b.score * 100).toFixed(0)}%` : ""}`;
+          const metrics = ctx.measureText(label);
+          const padX = 6;
+          const padY = 3;
+          const textW = metrics.width + padX * 2;
+          const textH = 16 + padY;
+          ctx.fillRect(x, y - textH < 0 ? y : y - textH, textW, textH);
+          ctx.fillStyle = "#fff";
+          ctx.fillText(label, x + padX, y - textH < 0 ? y + padY : y - textH + padY);
+          ctx.fillStyle = "rgba(0,0,0,0.6)";
+        }
+      });
+    };
+
+    drawBoxes(data.faces, "#46d6a2");
+    drawBoxes(data.gadgets, "#f5d97e");
+  }, [flags.overlays]);
 
   useEffect(() => {
     let cancelled = false;
 
-    async function loadYolo() {
-      setYoloState("loading");
-      try {
-        const { pipeline } = await import("@xenova/transformers");
-        const detector = await pipeline("object-detection", "Xenova/yolov8n");
-        if (cancelled) return;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        yoloRef.current = detector as any;
-        setYoloState("ready");
-      } catch (error) {
-        console.error("Failed to load YOLO", error);
-        if (!cancelled) setYoloState("error");
-      }
-    }
-    loadYolo();
+    const tick = async () => {
+      if (cancelled) return;
+      const frame = renderFrame();
+      if (!frame) return;
 
-    const runDetector = async () => {
-      const detector = yoloRef.current;
-      const video = videoRef.current;
-      const offscreen = offscreenCanvasRef.current;
-      if (!detector || !video || !offscreen || video.readyState < HTMLMediaElement.HAVE_ENOUGH_DATA) {
-        return;
-      }
-      offscreen.width = 640;
-      offscreen.height = Math.floor((video.videoHeight / video.videoWidth) * 640) || 360;
-      const ctx = offscreen.getContext("2d");
-      if (!ctx) return;
-      ctx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
-      try {
-        const detections = await detector(offscreen);
-        const persons = detections.filter((d) => d.label === "person" && d.score >= 0.45).length;
-        const gadget = detections.find((d) => gadgetLabels.includes(d.label) && d.score >= 0.35);
-
-        if (flags.faces && persons > 1) {
-          postEvent("yolo-multi-person", "faces", toKind("faces"), "warn", `${persons} people detected in frame (YOLO)`);
-        }
-        if (flags.gadgets && gadget) {
-          const label = gadget.label as string;
-          setGadgetHit(`${label} (${Math.round(gadget.score * 100)}%)`);
-          postEvent(
-            "yolo-gadget",
-            "gadgets",
-            toKind("gadgets"),
-            "warn",
-            `Gadget detected: ${label}`
-          );
-        }
-      } catch (error) {
-        console.warn("YOLO detection failed", error);
-      }
+      // Face first (feeds primary face selection), then parallelize gaze + gadgets
+      await runFaceDetection(frame);
+      await Promise.all([runGazeEstimation(), runGadgetDetection(frame)]);
+      drawOverlay();
     };
 
-    const interval = window.setInterval(runDetector, YOLO_SAMPLE_MS);
+    const interval = window.setInterval(tick, DETECT_SAMPLE_MS);
+    tick();
 
     return () => {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [flags.faces, flags.gadgets, offscreenCanvasRef, postEvent]);
+  }, [drawOverlay, renderFrame, runFaceDetection, runGadgetDetection, runGazeEstimation]);
+
+  useEffect(() => {
+    // Clear overlay when toggling off
+    drawOverlay();
+  }, [drawOverlay, flags.overlays]);
 
   const overlay = overlayForState(cameraState, overlayMessage);
 
@@ -404,15 +585,16 @@ export function IndividualProctor({ flags, postEvent }: { flags: IndividualFlags
         detail: faceCount > 1 ? "Multiple people present" : faceCount === 1 ? "Single face" : "No face",
         tone: faceCount === 1 ? "ok" : "warn",
       },
-      {
-        label: "Gaze + distance",
-        value: `${primaryYaw !== null ? `${primaryYaw.toFixed(1)}°` : "--"} | ${primaryDistance !== null ? `${primaryDistance.toFixed(0)} cm` : "--"}`,
-        detail: primaryYaw !== null ? "Yaw from nose vs eyes" : "Waiting for a face",
-        tone: primaryYaw !== null ? "ok" : "warn",
-      },
     ],
-    [cameraState, faceCount, isCameraActive, isMicActive, micState, overlay, primaryDistance, primaryYaw, speechActive]
+    [cameraState, faceCount, isCameraActive, isMicActive, micState, overlay, speechActive]
   );
+
+  const formatAngle = useCallback((val: number | null, axis: "yaw" | "pitch") => {
+    if (val == null) return "--";
+    const deg = val * 90;
+    const direction = axis === "yaw" ? (deg > 1 ? "right" : deg < -1 ? "left" : "centered") : deg > 1 ? "down" : deg < -1 ? "up" : "level";
+    return `${deg.toFixed(1)}° ${direction}`;
+  }, []);
 
   return (
     <div className="mode-panel">
@@ -431,15 +613,43 @@ export function IndividualProctor({ flags, postEvent }: { flags: IndividualFlags
         ))}
       </section>
 
-      <section className="video-panel">
+      <section className="video-panel" style={{ position: "relative" }}>
         <video ref={videoRef} autoPlay playsInline muted className={isCameraActive ? "ready" : "dimmed"} />
-        <canvas ref={canvasRef} className="overlay" />
+        <canvas ref={overlayCanvasRef} className="overlay" />
         {overlay && (
           <div className="video-overlay">
             <p>{overlay}</p>
           </div>
         )}
-        <MediaPills yoloState={yoloState} isCameraActive={isCameraActive} speechActive={speechActive} faceCount={faceCount} />
+        {showAngles && (
+          <div
+            className="angle-overlay"
+            style={{
+              position: "absolute",
+              left: "12px",
+              bottom: "12px",
+              background: "rgba(0,0,0,0.6)",
+              color: "#fff",
+              padding: "10px 12px",
+              borderRadius: "10px",
+              fontSize: "13px",
+              lineHeight: 1.35,
+              backdropFilter: "blur(6px)",
+              pointerEvents: "none",
+              zIndex: 3,
+            }}
+          >
+            <p>Yaw: {formatAngle(gazeAngles.yaw, "yaw")}</p>
+            <p>Pitch: {formatAngle(gazeAngles.pitch, "pitch")}</p>
+          </div>
+        )}
+        <MediaPills
+          faceApiState={faceApiState}
+          gadgetYoloState={gadgetYoloState}
+          isCameraActive={isCameraActive}
+          speechActive={speechActive}
+          faceCount={faceCount}
+        />
       </section>
 
       <section className="event-stream">
@@ -452,6 +662,9 @@ export function IndividualProctor({ flags, postEvent }: { flags: IndividualFlags
           <div className="actions">
             <button type="button" className="ghost" onClick={startStreams} disabled={cameraState === "starting"}>
               Restart capture
+            </button>
+            <button type="button" className="ghost" onClick={() => setShowAngles((prev) => !prev)}>
+              {showAngles ? "Hide angles" : "Show angles"}
             </button>
             <button type="button" className="ghost" onClick={stopStreams}>
               Stop capture

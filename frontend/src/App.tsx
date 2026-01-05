@@ -1,58 +1,17 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import "./global.css";
 import IndividualProctor from "./proctor/IndividualProctor";
-import TeamProctor from "./proctor/TeamProctor";
-import type {
-  EventCategory,
-  EventKind,
-  EventRecord,
-  IndividualFlags,
-  Severity,
-  TeamFlags,
-} from "./proctor/types";
+import type { EventCategory, EventKind, EventRecord, IndividualFlags, Severity } from "./proctor/types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
-
-type ProctorMode = "individual" | "team";
 
 const defaultIndividualFlags: IndividualFlags = {
   audio: true,
   gaze: true,
   faces: true,
   gadgets: true,
+  overlays: true,
 };
-
-const defaultTeamFlags: TeamFlags = {
-  capacity: true,
-  presence: true,
-  gaze: false,
-};
-
-const modeMeta: Record<ProctorMode, { title: string; copy: string }> = {
-  individual: {
-    title: "Individual proctoring",
-    copy: "YOLO object checks for gadgets, MediaPipe gaze for solo test takers.",
-  },
-  team: {
-    title: "Team proctoring",
-    copy: "Headcount cap with face presence checks for small groups.",
-  },
-};
-
-const ModeToggle = ({ mode, onChange }: { mode: ProctorMode; onChange: (next: ProctorMode) => void }) => (
-  <div className="mode-toggle">
-    {(["individual", "team"] as ProctorMode[]).map((value) => (
-      <button
-        key={value}
-        type="button"
-        className={`mode-tab ${mode === value ? "active" : ""}`}
-        onClick={() => onChange(value)}
-      >
-        {modeMeta[value].title}
-      </button>
-    ))}
-  </div>
-);
 
 const FlagToggle = ({
   label,
@@ -79,21 +38,15 @@ function App() {
     () => (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `session-${Date.now()}`),
     []
   );
-  const [mode, setMode] = useState<ProctorMode>("individual");
-  const [teamLimit, setTeamLimit] = useState(3);
   const [individualFlags, setIndividualFlags] = useState<IndividualFlags>(defaultIndividualFlags);
-  const [teamFlags, setTeamFlags] = useState<TeamFlags>(defaultTeamFlags);
   const [events, setEvents] = useState<EventRecord[]>([]);
   const lastEventRef = useRef<Record<string, number>>({});
 
   const isFlagEnabled = useCallback(
     (category: EventCategory) => {
-      if (mode === "individual") {
-        return individualFlags[category as keyof IndividualFlags] ?? true;
-      }
-      return teamFlags[category as keyof TeamFlags] ?? true;
+      return individualFlags[category as keyof IndividualFlags] ?? true;
     },
-    [individualFlags, mode, teamFlags]
+    [individualFlags]
   );
 
   const postEvent = useCallback(
@@ -134,7 +87,7 @@ function App() {
     [isFlagEnabled, sessionId]
   );
 
-  const flagPanel = mode === "individual" ? (
+  const flagPanel = (
     <div className="flag-grid">
       <FlagToggle
         label="Audio flags"
@@ -160,43 +113,12 @@ function App() {
         checked={individualFlags.gadgets}
         onChange={(checked) => setIndividualFlags((prev) => ({ ...prev, gadgets: checked }))}
       />
-    </div>
-  ) : (
-    <div className="flag-grid">
       <FlagToggle
-        label="Headcount cap"
-        note="Raise a flag when more than allowed join"
-        checked={teamFlags.capacity}
-        onChange={(checked) => setTeamFlags((prev) => ({ ...prev, capacity: checked }))}
+        label="Show bounding boxes"
+        note="Draw face and gadget boxes on the feed"
+        checked={individualFlags.overlays}
+        onChange={(checked) => setIndividualFlags((prev) => ({ ...prev, overlays: checked }))}
       />
-      <FlagToggle
-        label="Presence flags"
-        note="Warn when nobody is in frame"
-        checked={teamFlags.presence}
-        onChange={(checked) => setTeamFlags((prev) => ({ ...prev, presence: checked }))}
-      />
-      <FlagToggle
-        label="Gaze drift"
-        note="Flag head turns for the primary speaker"
-        checked={teamFlags.gaze}
-        onChange={(checked) => setTeamFlags((prev) => ({ ...prev, gaze: checked }))}
-      />
-      <label className="flag-toggle numeric">
-        <div>
-          <p className="flag-label">Teammate limit</p>
-          <p className="flag-note">Allowed people in frame</p>
-        </div>
-        <input
-          type="number"
-          min={1}
-          max={10}
-          value={teamLimit}
-          onChange={(e) => {
-            const next = Number(e.target.value) || 1;
-            setTeamLimit(Math.min(10, Math.max(1, next)));
-          }}
-        />
-      </label>
     </div>
   );
 
@@ -205,22 +127,17 @@ function App() {
       <header className="page-header">
         <div>
           <p className="eyebrow">Proctoring prototype</p>
-          <h1>{modeMeta[mode].title}</h1>
-          <p className="lede">{modeMeta[mode].copy}</p>
+          <h1>Individual proctoring</h1>
+          <p className="lede">Backend YOLO face counts plus on-device gadget checks for solo test takers.</p>
         </div>
         <div className="session-tag">Session {sessionId.slice(-6)}</div>
       </header>
 
       <section className="mode-selector">
-        <ModeToggle mode={mode} onChange={setMode} />
         {flagPanel}
       </section>
 
-      {mode === "individual" ? (
-        <IndividualProctor flags={individualFlags} postEvent={postEvent} />
-      ) : (
-        <TeamProctor teamLimit={teamLimit} flags={teamFlags} postEvent={postEvent} />
-      )}
+      <IndividualProctor flags={individualFlags} postEvent={postEvent} />
 
       <section className="event-stream">
         <div className="stream-header">

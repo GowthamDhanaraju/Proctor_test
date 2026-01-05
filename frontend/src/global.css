@@ -44,31 +44,6 @@ main.app-shell {
   gap: 1rem;
 }
 
-.mode-toggle {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 0.65rem;
-}
-
-.mode-tab {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 0.85rem;
-  padding: 0.75rem 1rem;
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text);
-  font-weight: 700;
-  cursor: pointer;
-  transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
-  box-shadow: none;
-  font-size: 0.95rem;
-}
-
-.mode-tab.active {
-  background: linear-gradient(135deg, rgba(245, 217, 126, 0.15), rgba(70, 214, 162, 0.12));
-  border-color: rgba(245, 217, 126, 0.5);
-  transform: translateY(-1px);
-}
-
 .flag-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));

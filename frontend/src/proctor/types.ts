@@ -11,7 +11,7 @@ export type EventRecord = {
   kind: EventKind;
 };
 
-export type EventCategory = "audio" | "gaze" | "faces" | "gadgets" | "capacity" | "presence" | "system";
+export type EventCategory = "audio" | "gaze" | "faces" | "gadgets" | "system";
 
 export type PostEventFn = (
   key: string,
@@ -26,10 +26,5 @@ export type IndividualFlags = {
   gaze: boolean;
   faces: boolean;
   gadgets: boolean;
-};
-
-export type TeamFlags = {
-  capacity: boolean;
-  presence: boolean;
-  gaze: boolean;
+  overlays: boolean;
 };
